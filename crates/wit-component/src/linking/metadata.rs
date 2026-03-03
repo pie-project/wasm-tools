@@ -187,6 +187,9 @@ pub struct Metadata<'a> {
     /// Whether this module exports `__wasm_set_libraries`
     pub has_set_libraries: bool,
 
+    /// Whether this module exports `__set_app_data`
+    pub has_set_app_data: bool,
+
     /// Whether this module includes any `component-type*` custom sections which include exports
     pub has_component_exports: bool,
 
@@ -240,6 +243,7 @@ impl<'a> Metadata<'a> {
             has_initialize: false,
             has_wasi_start: false,
             has_set_libraries: false,
+            has_set_app_data: false,
             has_component_exports,
             is_asyncified: false,
             env_imports: BTreeSet::new(),
@@ -470,6 +474,7 @@ impl<'a> Metadata<'a> {
                             "_initialize" => result.has_initialize = true,
                             "_start" => result.has_wasi_start = true,
                             "__wasm_set_libraries" => result.has_set_libraries = true,
+                            "__set_app_data" => result.has_set_app_data = true,
                             _ => {
                                 let ty = match export.kind {
                                     ExternalKind::Func => Type::Function(FunctionType::try_from(

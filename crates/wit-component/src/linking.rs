@@ -266,6 +266,19 @@ impl<K: Hash + Eq + PartialEq + Debug, V: Debug> InsertUnique for HashMap<K, V> 
     }
 }
 
+/// Layout of app-specific data embedded in the component's linear memory
+struct AppDataLayout {
+    /// Combined buffer: [symbols_json | world_module_name | world_source | app_sources]
+    buffer: Vec<u8>,
+    /// Offset in linear memory where the buffer starts
+    memory_base: u32,
+    /// (offset, len) for each piece of data relative to memory start
+    symbols_json: (u32, u32),
+    world_module: (u32, u32),
+    world_source: (u32, u32),
+    app_sources: (u32, u32),
+}
+
 /// Synthesize the "main" module for the component, responsible for exporting functions which break cyclic
 /// dependencies, as well as hosting the memory and function table.
 fn make_env_module<'a>(
@@ -273,7 +286,8 @@ fn make_env_module<'a>(
     env_exports: &[EnvExport<'_>],
     cabi_realloc_exporter: Option<&str>,
     stack_size_bytes: u32,
-) -> (Vec<u8>, DlOpenables<'a>, u32) {
+    app_data: Option<(Vec<u8>, String, Vec<u8>, Vec<u8>)>,
+) -> (Vec<u8>, DlOpenables<'a>, Option<AppDataLayout>, u32) {
     // TODO: deduplicate types
     let mut types = TypeSection::new();
     let mut imports = ImportSection::new();
@@ -344,6 +358,38 @@ fn make_env_module<'a>(
 
     table_offset += dl_openables.function_count;
     memory_offset += u32::try_from(dl_openables.buffer.len()).unwrap();
+
+    let app_data_layout = app_data.map(|(symbols_json, world_module, world_source, app_sources)| {
+        memory_offset = align(memory_offset, 4);
+        let base = memory_offset;
+
+        let sym_offset = 0u32;
+        let sym_len = u32::try_from(symbols_json.len()).unwrap();
+        let mut buffer = symbols_json;
+
+        let mod_offset = u32::try_from(buffer.len()).unwrap();
+        let mod_len = u32::try_from(world_module.len()).unwrap();
+        buffer.extend(world_module.as_bytes());
+
+        let src_offset = u32::try_from(buffer.len()).unwrap();
+        let src_len = u32::try_from(world_source.len()).unwrap();
+        buffer.extend(world_source);
+
+        let app_src_offset = u32::try_from(buffer.len()).unwrap();
+        let app_src_len = u32::try_from(app_sources.len()).unwrap();
+        buffer.extend(app_sources);
+
+        memory_offset += u32::try_from(buffer.len()).unwrap();
+
+        AppDataLayout {
+            buffer,
+            memory_base: base,
+            symbols_json: (base + sym_offset, sym_len),
+            world_module: (base + mod_offset, mod_len),
+            world_source: (base + src_offset, src_len),
+            app_sources: (base + app_src_offset, app_src_len),
+        }
+    });
 
     let memory_size = {
         let mut add_global_export = |name: &str, value, mutable| {
@@ -552,7 +598,7 @@ fn make_env_module<'a>(
     let module = module.finish();
     wasmparser::validate(&module).unwrap();
 
-    (module, dl_openables, indirection_table_base)
+    (module, dl_openables, app_data_layout, indirection_table_base)
 }
 
 /// Synthesize the "init" module, responsible for initializing global variables per the dynamic linking tool
@@ -564,6 +610,7 @@ fn make_init_module(
     exporters: &IndexMap<&ExportKey, (&str, &Export)>,
     env_exports: &[EnvExport<'_>],
     dl_openables: DlOpenables,
+    app_data_layout: Option<AppDataLayout>,
     indirection_table_base: u32,
 ) -> Result<Vec<u8>> {
     let mut module = Module::new();
@@ -574,7 +621,16 @@ fn make_init_module(
     let thunk_ty = 0;
     types.ty().function([ValType::I32], []);
     let one_i32_param_ty = 1;
-    let mut type_offset = 2;
+
+    let has_app_data = app_data_layout.is_some()
+        && metadata.iter().any(|m| m.has_set_app_data);
+    let eight_i32_param_ty = if has_app_data {
+        types.ty().function([ValType::I32; 8], []);
+        Some(2)
+    } else {
+        None
+    };
+    let mut type_offset = if has_app_data { 3 } else { 2 };
 
     for metadata in metadata {
         if metadata.dl_openable {
@@ -731,6 +787,25 @@ fn make_init_module(
             )));
         }
 
+        if metadata.has_set_app_data {
+            if let (Some(layout), Some(ty)) = (&app_data_layout, eight_i32_param_ty) {
+                ctor_calls.push(Ins::I32Const(i32::try_from(layout.symbols_json.0).unwrap()));
+                ctor_calls.push(Ins::I32Const(i32::try_from(layout.symbols_json.1).unwrap()));
+                ctor_calls.push(Ins::I32Const(i32::try_from(layout.world_module.0).unwrap()));
+                ctor_calls.push(Ins::I32Const(i32::try_from(layout.world_module.1).unwrap()));
+                ctor_calls.push(Ins::I32Const(i32::try_from(layout.world_source.0).unwrap()));
+                ctor_calls.push(Ins::I32Const(i32::try_from(layout.world_source.1).unwrap()));
+                ctor_calls.push(Ins::I32Const(i32::try_from(layout.app_sources.0).unwrap()));
+                ctor_calls.push(Ins::I32Const(i32::try_from(layout.app_sources.1).unwrap()));
+                ctor_calls.push(Ins::Call(add_function_import(
+                    &mut imports,
+                    metadata.name,
+                    "__set_app_data",
+                    ty,
+                )));
+            }
+        }
+
         for import in &metadata.memory_address_imports {
             let (exporter, _) = find_offset_exporter(import, exporters)?;
 
@@ -832,6 +907,9 @@ fn make_init_module(
 
     let mut data = DataSection::new();
     data.active(0, &const_u32(dl_openables.memory_base), dl_openables.buffer);
+    if let Some(layout) = app_data_layout {
+        data.active(0, &const_u32(layout.memory_base), layout.buffer);
+    }
     module.section(&data);
 
     module.section(&RawCustomSection(
@@ -1303,10 +1381,11 @@ fn find_reachable<'a>(
 /// Builder type for composing dynamic library modules into a component
 #[derive(Default)]
 pub struct Linker {
-    /// The `(name, module, dl_openable)` triple representing the libraries to be composed
+    /// The `(name, module, dl_openable, external)` tuple representing the libraries to be composed
     ///
     /// The order of this list determines priority in cases where more than one library exports the same symbol.
-    libraries: Vec<(String, Vec<u8>, bool)>,
+    /// If `external` is true, the module will be imported as a core module rather than embedded.
+    libraries: Vec<(String, Vec<u8>, bool, bool)>,
 
     /// The set of adapters to use when generating the component
     adapters: Vec<(String, Vec<u8>)>,
@@ -1332,6 +1411,10 @@ pub struct Linker {
     /// from two different libraries, whether their imports are unified when the
     /// semver version ranges for interface allow it.
     merge_imports_based_on_semver: Option<bool>,
+
+    /// Optional app-specific data to embed in the component's linear memory.
+    /// (symbols_json, world_module_name, world_source, app_sources_archive)
+    app_data: Option<(Vec<u8>, String, Vec<u8>, Vec<u8>)>,
 }
 
 impl Linker {
@@ -1341,7 +1424,20 @@ impl Linker {
     /// for runtime resolution.
     pub fn library(mut self, name: &str, module: &[u8], dl_openable: bool) -> Result<Self> {
         self.libraries
-            .push((name.to_owned(), module.to_vec(), dl_openable));
+            .push((name.to_owned(), module.to_vec(), dl_openable, false));
+
+        Ok(self)
+    }
+
+    /// Add an external dynamic library module to this linker.
+    ///
+    /// The module bytes are used for link-time analysis (resolving imports/exports),
+    /// but the module will NOT be embedded in the output component. Instead, a core
+    /// module import will be generated, and the module bytes must be provided by the
+    /// host or an outer component at instantiation time.
+    pub fn external_library(mut self, name: &str, module: &[u8], dl_openable: bool) -> Result<Self> {
+        self.libraries
+            .push((name.to_owned(), module.to_vec(), dl_openable, true));
 
         Ok(self)
     }
@@ -1395,6 +1491,23 @@ impl Linker {
         self
     }
 
+    /// Embed application-specific data (symbols JSON, world module name,
+    /// world bindings source, and app sources archive) directly in the
+    /// component's linear memory.
+    ///
+    /// The `__init` module will write these bytes into a data segment and call
+    /// `__set_app_data` on the runtime module during instantiation.
+    pub fn app_data(
+        mut self,
+        symbols_json: Vec<u8>,
+        world_module: String,
+        world_source: Vec<u8>,
+        app_sources: Vec<u8>,
+    ) -> Self {
+        self.app_data = Some((symbols_json, world_module, world_source, app_sources));
+        self
+    }
+
     /// Encode the component and return the bytes
     pub fn encode(mut self) -> Result<Vec<u8>> {
         if self.use_built_in_libdl {
@@ -1415,7 +1528,7 @@ impl Linker {
         let metadata = self
             .libraries
             .iter()
-            .map(|(name, module, dl_openable)| {
+            .map(|(name, module, dl_openable, _external)| {
                 Metadata::try_new(name, *dl_openable, module, &adapter_names)
                     .with_context(|| format!("failed to extract linking metadata from {name}"))
             })
@@ -1486,7 +1599,7 @@ impl Linker {
             {
                 self.stub_missing_functions = false;
                 self.libraries
-                    .push((STUB_LIBRARY_NAME.into(), make_stubs_module(&missing), false));
+                    .push((STUB_LIBRARY_NAME.into(), make_stubs_module(&missing), false, false));
                 return self.encode();
             } else {
                 bail!(
@@ -1525,7 +1638,7 @@ impl Linker {
             reexport_cabi_realloc,
         } = env_exports(&metadata, &exporters, &topo_sorted)?;
 
-        let (env_module, dl_openables, table_base) = make_env_module(
+        let (env_module, dl_openables, app_data_layout, table_base) = make_env_module(
             &metadata,
             &env_exports,
             if reexport_cabi_realloc {
@@ -1536,6 +1649,7 @@ impl Linker {
                 cabi_realloc_exporter
             },
             self.stack_size.unwrap_or(DEFAULT_STACK_SIZE_BYTES),
+            self.app_data.take(),
         );
 
         let mut encoder = ComponentEncoder::default()
@@ -1573,7 +1687,7 @@ impl Linker {
 
         let mut seen = HashSet::new();
         for index in topo_sorted {
-            let (name, module, _) = &self.libraries[index];
+            let (name, module, _, external) = &self.libraries[index];
             let metadata = &metadata[index];
 
             let env_items = default_env_items
@@ -1679,6 +1793,7 @@ impl Linker {
                 module,
                 LibraryInfo {
                     instantiate_after_shims: false,
+                    external: *external,
                     arguments: [
                         ("GOT.mem".into(), Instance::Items(mem_items)),
                         ("GOT.func".into(), Instance::Items(func_items)),
@@ -1705,10 +1820,12 @@ impl Linker {
                     &exporters,
                     &env_exports,
                     dl_openables,
+                    app_data_layout,
                     table_base,
                 )?,
                 LibraryInfo {
                     instantiate_after_shims: true,
+                    external: false,
                     arguments: iter::once((
                         "env".into(),
                         Instance::MainOrAdapter(MainOrAdapter::Main),

@@ -863,12 +863,30 @@ fn make_init_module(
         })
         .collect::<Vec<_>>();
 
+    let prepare_snapshot_func = metadata
+        .iter()
+        .find(|m| m.has_prepare_snapshot)
+        .map(|m| {
+            add_function_import(
+                &mut imports,
+                m.name,
+                "__prepare_snapshot",
+                thunk_ty,
+            )
+        });
+
     module.section(&imports);
 
     {
         let mut functions = FunctionSection::new();
         functions.function(thunk_ty);
         module.section(&functions);
+    }
+
+    if let Some(func_idx) = prepare_snapshot_func {
+        let mut exports = ExportSection::new();
+        exports.export("__prepare_snapshot", ExportKind::Func, func_idx);
+        module.section(&exports);
     }
 
     module.section(&StartSection {
@@ -1652,9 +1670,12 @@ impl Linker {
             self.app_data.take(),
         );
 
+        let has_prepare_snapshot = metadata.iter().any(|m| m.has_prepare_snapshot);
+
         let mut encoder = ComponentEncoder::default()
             .validate(self.validate)
-            .debug_names(self.debug_names);
+            .debug_names(self.debug_names)
+            .prepare_snapshot_export(has_prepare_snapshot);
         if let Some(merge) = self.merge_imports_based_on_semver {
             encoder = encoder.merge_imports_based_on_semver(merge);
         };

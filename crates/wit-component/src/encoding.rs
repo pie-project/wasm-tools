@@ -3208,6 +3208,7 @@ pub struct ComponentEncoder {
     merge_imports_based_on_semver: Option<bool>,
     pub(super) reject_legacy_names: bool,
     debug_names: bool,
+    has_prepare_snapshot_export: bool,
 }
 
 impl ComponentEncoder {
@@ -3396,6 +3397,14 @@ impl ComponentEncoder {
         self
     }
 
+    /// If set, the component will export a `__prepare-snapshot` function
+    /// by aliasing and lifting the `__prepare_snapshot` core export from the
+    /// `__init` library module.
+    pub fn prepare_snapshot_export(mut self, value: bool) -> Self {
+        self.has_prepare_snapshot_export = value;
+        self
+    }
+
     /// Encode the component and return the bytes.
     pub fn encode(&mut self) -> Result<Vec<u8>> {
         if self.module.is_empty() {
@@ -3433,6 +3442,33 @@ impl ComponentEncoder {
         for name in self.adapters.keys() {
             state.encode_exports(CustomModule::Adapter(name))?;
         }
+
+        if self.has_prepare_snapshot_export {
+            if let Some(&init_instance) = state.adapter_instances.get("__init") {
+                let core_func = state.component.core_alias_export(
+                    Some("__prepare_snapshot"),
+                    init_instance,
+                    "__prepare_snapshot",
+                    ExportKind::Func,
+                );
+                let (func_type_idx, mut encoder) =
+                    state.component.type_function(Some("__prepare-snapshot-type"));
+                encoder.params(Vec::<(&str, ComponentValType)>::new()).result(None);
+                let lifted = state.component.lift_func(
+                    Some("prepare-snapshot"),
+                    core_func,
+                    func_type_idx,
+                    [],
+                );
+                state.component.export(
+                    "prepare-snapshot",
+                    ComponentExportKind::Func,
+                    lifted,
+                    None,
+                );
+            }
+        }
+
         state.component.append_names();
         state
             .component
